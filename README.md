@@ -1,0 +1,441 @@
+# 🤖 AI-Powered Code Review GitHub Assistant
+
+A production-grade GitHub App that automatically reviews every pull request using AI (GPT-4o / Gemini) and posts inline comments directly on the PR — just like a senior engineer reviewing your code.
+
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue?logo=typescript)
+![Node.js](https://img.shields.io/badge/Node.js-18+-green?logo=node.js)
+![React](https://img.shields.io/badge/React-18-blue?logo=react)
+![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-green?logo=mongodb)
+![Redis](https://img.shields.io/badge/Redis-Upstash-red?logo=redis)
+
+---
+
+## 📸 Screenshots
+
+> Dashboard showing real-time review stats and recent PR reviews
+
+![Dashboard](screenshots/dashboard.png)
+
+---
+
+## 🏗️ Architecture
+
+```
+GitHub PR opened
+      │
+      ▼
+Express /webhook  ←── HMAC-SHA256 verified (timing-safe)
+      │  Returns 200 immediately (async decoupling)
+      │  Redis idempotency check using X-GitHub-Delivery UUID
+      ▼
+Redis Queue (Bull)
+      │  Job: { repoFullName, prNumber, installationId, deliveryId }
+      │  3 retries with exponential backoff (3s → 6s → 12s)
+      ▼
+Worker (in-process dev / AWS Lambda prod)
+      │  1. GitHub App auth → installation access token
+      │  2. Fetch PR diff + file list in parallel
+      │  3. Send diff to AI → structured JSON review
+      │  4. Post inline comments back to PR via GitHub API
+      │  5. Save full review to MongoDB
+      ▼
+MongoDB Atlas  ←──→  React Dashboard (Vite)
+                      Stats, scores, inline comments UI
+```
+
+### Key Design Decisions
+
+| Decision | Why |
+|---|---|
+| Return 200 before processing | GitHub marks delivery failed if no 2xx in 10s. AI review takes 15-30s. Without this every review triggers retries and duplicates. |
+| Redis idempotency (deliveryId) | GitHub retries failed webhooks. We store `X-GitHub-Delivery` UUID in Redis (24h TTL) to skip duplicates. |
+| `crypto.timingSafeEqual` for HMAC | Regular string `===` leaks timing info. An attacker could brute-force the secret by measuring response time. |
+| Bull queue with exponential backoff | If AI or GitHub API is down, jobs retry automatically at 3s, 6s, 12s delays without losing data. |
+| `response_format: json_object` | Forces AI to return valid JSON — no regex parsing, no malformed responses. |
+| MongoDB for reviews | Each review has a variable-length comments array. Document model fits this naturally vs relational SQL. |
+| In-process worker (dev) | Simpler local setup. Deploy as separate Lambda for production horizontal scaling. |
+
+---
+
+## 📁 Project Structure
+
+```
+ai-code-reviewer/
+├── backend/                        # Node.js + Express + TypeScript API
+│   ├── src/
+│   │   ├── app.ts                  # Express entry — routes, CORS, error handler, bootstrap
+│   │   ├── types/
+│   │   │   └── index.ts            # All shared TypeScript interfaces
+│   │   ├── middleware/
+│   │   │   └── verifyWebhook.ts    # HMAC-SHA256 signature verification
+│   │   ├── models/
+│   │   │   └── review.ts           # Mongoose schema + virtual issueCount
+│   │   ├── routes/
+│   │   │   ├── webhook.ts          # POST /webhook — GitHub event handler
+│   │   │   ├── reviews.ts          # GET /api/reviews, /stats, /:id, /pr/:owner/:repo/:num
+│   │   │   └── repos.ts            # GET /api/repos — aggregated repo list
+│   │   └── services/
+│   │       ├── queue.ts            # Bull queue + Redis idempotency + Upstash TLS fix
+│   │       ├── github.ts           # Octokit: installation auth, fetch diff, post comments
+│   │       ├── openai.ts           # AI review engine (GPT-4o or Gemini)
+│   │       └── worker.ts           # Queue processor with full error logging
+│   ├── .env                        # ⚠️ Secrets — never commit
+│   ├── .env.example                # Template with all required variables
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── frontend/                       # React 18 + TypeScript + Vite dashboard
+│   ├── src/
+│   │   ├── App.tsx                 # Route definitions
+│   │   ├── main.tsx                # React entry + BrowserRouter
+│   │   ├── types/
+│   │   │   └── index.ts            # Frontend TypeScript interfaces
+│   │   ├── services/
+│   │   │   └── api.ts              # Generic typed fetch wrapper
+│   │   ├── components/
+│   │   │   └── layout.tsx          # Sidebar + nav shell (GitHub dark theme)
+│   │   └── pages/
+│   │       ├── dashboard.tsx       # Stats cards + 7-day chart + queue status + recent reviews
+│   │       ├── reviews.tsx         # Paginated table with status filter
+│   │       └── reviewDetail.tsx    # Full review with per-file inline comment tabs
+│   ├── .env                        # VITE_API_URL
+│   ├── index.html                  # CSS variables — GitHub dark theme
+│   ├── vite.config.ts              # Dev proxy to backend
+│   └── tsconfig.json
+│
+├── worker/
+│   └── src/
+│       └── handler.ts              # AWS Lambda production worker version
+│
+├── docker-compose.yml              # Local MongoDB + Redis (optional alternative to cloud)
+└── README.md
+```
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Technology | Why |
+|---|---|---|
+| Backend API | Node.js 18 + Express 4 + TypeScript | Fast, familiar, huge ecosystem |
+| Database | MongoDB Atlas + Mongoose | Flexible schema for variable-length comment arrays |
+| Queue | Redis (Upstash) + Bull | Async job processing, automatic retries, idempotency |
+| AI Engine | OpenAI GPT-4o / Google Gemini | Best code understanding, structured JSON output |
+| GitHub Integration | `@octokit/app` + `@octokit/rest` | Official SDK — handles JWT, installation tokens |
+| Frontend | React 18 + TypeScript + Vite | Fast HMR, type-safe, modern |
+| Charts | Recharts | React-native chart library |
+| Deployment | Railway (backend) + Vercel (frontend) | Zero-config PaaS |
+
+---
+
+## ⚙️ Complete Setup Guide
+
+### Prerequisites
+
+- Node.js 18+ → [nodejs.org](https://nodejs.org)
+- Git → [git-scm.com](https://git-scm.com)
+- GitHub account → [github.com](https://github.com)
+- MongoDB Atlas account (free) → [cloud.mongodb.com](https://cloud.mongodb.com)
+- Upstash Redis account (free) → [console.upstash.com](https://console.upstash.com)
+- OpenAI API key → [platform.openai.com](https://platform.openai.com) OR
+- Google Gemini API key (free) → [aistudio.google.com](https://aistudio.google.com)
+- ngrok → [ngrok.com/download](https://ngrok.com/download)
+
+---
+
+### Step 1 — Clone and install
+
+```bash
+git clone https://github.com/Nikita-7024/ai-code-reviewer.git
+cd ai-code-reviewer
+
+# Install backend
+cd backend
+npm install
+
+# Install frontend
+cd ../frontend
+npm install
+```
+
+---
+
+### Step 2 — MongoDB Atlas setup
+
+1. Go to [cloud.mongodb.com](https://cloud.mongodb.com) → create free M0 cluster
+2. **Database Access** → Add database user
+   - Username: anything
+   - Password: letters + numbers ONLY (no `@`, `#`, `$` — they break the URL)
+3. **Network Access** → Add IP Address → **Allow Access from Anywhere** (`0.0.0.0/0`)
+4. **Connect** → Drivers → copy connection string
+5. Replace `<password>` with your actual password
+6. Add `/ai-code-reviewer` before the `?`
+
+```
+mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/ai-code-reviewer?appName=Cluster0
+```
+
+---
+
+### Step 3 — Upstash Redis setup
+
+1. Go to [console.upstash.com](https://console.upstash.com) → Create database
+2. Choose region closest to you → Create
+3. Click **TCP** tab (not REST)
+4. Copy the full `REDIS_URL` — starts with `rediss://`
+
+---
+
+### Step 4 — ngrok setup (needed for GitHub webhooks)
+
+```bash
+# Download from https://ngrok.com/download
+# Sign up at https://dashboard.ngrok.com → copy your authtoken
+
+# Windows PowerShell — run from the ngrok folder:
+.\ngrok config add-authtoken YOUR_AUTHTOKEN
+.\ngrok http 3001
+
+# You'll get a URL like:
+# https://abc123.ngrok-free.app → http://localhost:3001
+# Keep this running while testing
+```
+
+> ⚠️ Free ngrok URL changes every restart. Update GitHub App webhook URL when it changes.
+
+---
+
+### Step 5 — Create GitHub App
+
+1. GitHub → **Settings** → **Developer settings** → **GitHub Apps** → **New GitHub App**
+
+2. Fill in:
+
+| Field | Value |
+|---|---|
+| GitHub App name | `AI Code Reviewer YourName` |
+| Homepage URL | `http://localhost:5173` |
+| Webhook URL | `https://YOUR-NGROK-URL.ngrok-free.app/webhook` |
+| Webhook secret | any random string min 32 chars e.g. `MySecret123456789AbCdEfGhIjKlMn` |
+
+3. **Repository permissions:**
+   - Pull requests → `Read & Write`
+   - Contents → `Read only`
+   - Metadata → `Read only`
+
+4. **Subscribe to events:**
+   - ✅ Pull request
+   - ✅ Installation
+
+5. Click **Create GitHub App**
+
+6. Note your **App ID** on the settings page
+
+7. Scroll down → **Generate a private key** → `.pem` file downloads
+
+8. Left sidebar → **Install App** → Install on your account → select repositories
+
+---
+
+### Step 6 — Configure environment
+
+Create `backend/.env`:
+
+```env
+# MongoDB Atlas — no special chars in password
+MONGODB_URI=mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/ai-code-reviewer?appName=Cluster0
+
+# Upstash Redis — TCP connection string, NO quotes
+REDIS_URL=rediss://default:yourpassword@your-host.upstash.io:6379
+
+# GitHub App
+GITHUB_APP_ID=123456
+GITHUB_WEBHOOK_SECRET=MySecret123456789AbCdEfGhIjKlMn
+
+# Private key — paste entire .pem file contents between the quotes
+GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA...
+...all lines of the key...
+-----END RSA PRIVATE KEY-----"
+
+# AI — use ONE of these:
+OPENAI_API_KEY=sk-your-key-here
+# OR for free alternative:
+GEMINI_API_KEY=AIzaSy-your-key-here
+
+# Server
+PORT=3001
+NODE_ENV=development
+FRONTEND_URL=http://localhost:5173
+```
+
+Create `frontend/.env`:
+
+```env
+VITE_API_URL=http://localhost:3001
+```
+
+#### ⚠️ Common `.env` mistakes:
+- No spaces around `=` signs
+- No quotes around Redis URL
+- MongoDB password must not contain `@` → use `%40` if it does
+- Private key must have `-----BEGIN RSA PRIVATE KEY-----` header and footer
+- Never commit `.env` to GitHub
+
+---
+
+### Step 7 — Run locally
+
+```bash
+# Terminal 1 — Backend
+cd backend
+npm run dev
+
+# Expected output (all 4 lines = success):
+# [MongoDB] Connected
+# [Worker] Starting queue processor...
+# [Worker] Ready — listening for jobs
+# [Server] http://localhost:3001 (development)
+
+# Terminal 2 — Frontend
+cd frontend
+npm run dev
+# Open http://localhost:5173
+
+# Terminal 3 — ngrok (keep running for webhooks)
+# Windows: .\ngrok http 3001
+```
+
+---
+
+### Step 8 — Test end-to-end
+
+1. Make sure all 3 terminals are running (backend, frontend, ngrok)
+2. Confirm ngrok URL matches webhook URL in GitHub App settings
+3. Go to a repo where the app is installed
+4. Create a new branch → make code changes → open Pull Request
+5. Watch backend terminal — you'll see:
+```
+[Webhook] PR #1 opened in yourname/repo
+[Queue] Job abc123 added
+[Worker] Processing PR #1
+[Gemini/OpenAI] Reviewing PR...
+[GitHub] Posted review on PR #1
+[Worker] ✓ Review saved — Score: 7/10
+```
+6. Check the PR on GitHub — AI inline comments appear on changed lines
+7. Refresh `http://localhost:5173` — review appears in dashboard
+
+---
+
+## 🚀 Deployment
+
+### Backend → Railway
+
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Deploy
+railway login
+cd backend
+railway init
+railway up
+
+# Add all environment variables in Railway dashboard:
+# https://railway.app → your project → Variables
+```
+
+### Frontend → Vercel
+
+```bash
+# Install Vercel CLI
+npm install -g vercel
+
+# Deploy
+cd frontend
+vercel --prod
+
+# When prompted, set environment variable:
+# VITE_API_URL = https://your-backend.railway.app
+```
+
+### Worker → AWS Lambda (production scale)
+
+```bash
+cd worker
+npm install -g serverless
+serverless deploy
+# Configure environment variables in AWS Console or serverless.yml
+```
+
+---
+
+## 📡 API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/webhook` | Receives GitHub webhook events (HMAC verified) |
+| `GET` | `/health` | Server health check — uptime, env |
+| `GET` | `/api/reviews` | Paginated list — supports `?page=1&limit=20&status=completed&repo=owner/repo` |
+| `GET` | `/api/reviews/stats` | Dashboard stats — scores, issue counts, 7-day activity, queue status |
+| `GET` | `/api/reviews/:id` | Single review with full inline comments |
+| `GET` | `/api/reviews/pr/:owner/:repo/:prNumber` | Lookup review by repo + PR number |
+| `GET` | `/api/repos` | All repos with aggregated review stats |
+
+---
+
+## 🐛 Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `bad auth: authentication failed` | Wrong MongoDB password | Reset password in Atlas → Database Access (use letters+numbers only) |
+| `querySrv ENOTFOUND` | `@` in password breaks URL | URL-encode `@` as `%40` in connection string |
+| `No "exports" main defined` | ESM package in CommonJS project | Downgrade: `@octokit/app@14`, `@octokit/rest@20`, `express@4`, `dotenv@16` |
+| `Reached max retries per request` | Bull + Upstash Redis incompatibility | Use `createClient` factory with `maxRetriesPerRequest: null` |
+| `Cannot read properties of undefined (reading 'pulls')` | Wrong Octokit type from `@octokit/app` | Use installation token to create `new Octokit({ auth: token })` directly |
+| `429 quota exceeded` | OpenAI free tier has no credits | Switch to Gemini free API or add OpenAI credits |
+| `Webhook URL not reachable` | Using localhost URL in GitHub App | Use ngrok HTTPS URL |
+| `404 Not Found` on webhook | Missing `/webhook` in URL | GitHub App webhook URL must end with `/webhook` |
+| `[Bootstrap] Fatal` on startup | Missing env variable | Check all required vars are set in `.env` |
+
+---
+
+## 💬 Interview Talking Points
+
+**"How do you prevent duplicate reviews when GitHub retries webhooks?"**
+> GitHub includes an `X-GitHub-Delivery` header — a unique UUID per event. Before queuing, I check Redis for that key. If found, I skip. After successful processing, I set it with 24h TTL. This makes the entire pipeline idempotent even under retry storms.
+
+**"Why return 200 before processing?"**
+> GitHub marks a delivery failed if no 2xx within 10 seconds. AI reviews take 15-30 seconds. Without async decoupling, every review would time out → retry → duplicate. The queue absorbs the latency completely.
+
+**"How do you verify webhooks are from GitHub?"**
+> GitHub signs every payload with HMAC-SHA256 using a shared secret. I recompute the hash server-side and compare using `crypto.timingSafeEqual` — not `===`. Regular string comparison leaks timing info that attackers can use to brute-force the secret character by character.
+
+**"How would you scale this to 10,000 repos?"**
+> The webhook server is stateless — horizontal scale behind a load balancer. Redis queue distributes work across multiple workers naturally. AWS Lambda auto-scales to 1000 concurrent executions. The real bottleneck is AI rate limits — I'd add a token-bucket rate limiter and potentially batch smaller PRs together.
+
+**"What happens if the AI service is down?"**
+> Bull retries 3 times with exponential backoff (3s, 6s, 12s). If all retries fail, the job moves to a dead letter queue and the review is saved to MongoDB with `status: 'failed'`. The dashboard shows failed reviews. When the service recovers, failed jobs can be manually retried from the dashboard.
+
+**"Why MongoDB over PostgreSQL?"**
+> Each review has a variable-length array of inline comments with different fields per severity level. MongoDB's document model stores this naturally as an embedded array. In PostgreSQL you'd need a separate `comments` table with joins — more complex for no benefit in this use case.
+
+---
+
+## 🔗 Useful Links
+
+| Resource | URL |
+|---|---|
+| MongoDB Atlas | https://cloud.mongodb.com |
+| Upstash Redis | https://console.upstash.com |
+| OpenAI Platform | https://platform.openai.com |
+| Google AI Studio (Gemini free) | https://aistudio.google.com |
+| ngrok Download | https://ngrok.com/download |
+| ngrok Dashboard + Authtoken | https://dashboard.ngrok.com/get-started/your-authtoken |
+| GitHub Apps Settings | https://github.com/settings/apps |
+| Railway (backend deploy) | https://railway.app |
+| Vercel (frontend deploy) | https://vercel.com |
+| Bull Queue Docs | https://github.com/OptimalBits/bull |
+| Octokit REST Docs | https://octokit.github.io/rest.js |
+| Express 4 Docs | https://expressjs.com/en/4x/api.html |

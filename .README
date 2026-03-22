@@ -1,0 +1,363 @@
+# AI-Powered Code Review GitHub Assistant
+
+A production-grade GitHub App that automatically reviews every pull request using GPT-4o and posts inline comments directly on the PR — just like a human reviewer.
+
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)
+![Node.js](https://img.shields.io/badge/Node.js-18+-green)
+![React](https://img.shields.io/badge/React-18-blue)
+![GPT-4o](https://img.shields.io/badge/GPT--4o-OpenAI-purple)
+![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-green)
+![Redis](https://img.shields.io/badge/Redis-Upstash-red)
+
+---
+
+## What It Does
+
+When a pull request is opened on any connected GitHub repository:
+
+1. GitHub sends a webhook to your Express server
+2. Server verifies the HMAC-SHA256 signature and returns 200 immediately
+3. Job is pushed to a Redis queue (prevents duplicates, handles retries)
+4. Worker picks up the job, fetches the PR diff via GitHub API
+5. Sends the diff to GPT-4o with a structured prompt
+6. Posts inline review comments back to the PR
+7. Saves the review to MongoDB
+8. Dashboard updates with score, summary, and comment breakdown
+
+---
+
+## Architecture
+
+```
+GitHub PR opened
+      │
+      ▼
+Express /webhook  ← HMAC-SHA256 verified
+      │  Returns 200 immediately (async decoupling)
+      │  Redis idempotency check (deliveryId)
+      ▼
+Redis Queue (Bull)
+      │  Job: { repoFullName, prNumber, installationId, deliveryId }
+      ▼
+Worker (in-process for dev / AWS Lambda for prod)
+      │  1. GitHub App auth (installation token)
+      │  2. Fetch PR diff + file list in parallel
+      │  3. Call GPT-4o → structured JSON review
+      │  4. Post inline comments to PR via GitHub API
+      │  5. Save review to MongoDB
+      ▼
+MongoDB Atlas  ←→  React Dashboard (Vite)
+```
+
+### Key Design Decisions
+
+| Decision | Why |
+|---|---|
+| Return 200 before processing | GitHub retries if no 2xx in 10s. GPT-4o takes 15-30s. Without this, every review triggers duplicates. |
+| Redis idempotency (deliveryId) | GitHub retries failed webhooks. We store delivery ID in Redis (24h TTL) to skip duplicates. |
+| `crypto.timingSafeEqual` for HMAC | Regular string comparison leaks timing info. This prevents brute-force attacks on the webhook secret. |
+| Bull queue with exponential backoff | If OpenAI or GitHub is down, jobs retry automatically (3s, 6s, 12s delays). |
+| `response_format: json_object` | Guarantees valid JSON from GPT-4o — no regex parsing, no malformed responses. |
+| MongoDB for reviews | Each review has a variable-length comments array. Document model fits naturally vs SQL. |
+| In-process worker (dev) | Simpler local setup — no separate process needed. Use Lambda version for production. |
+
+---
+
+## Project Structure
+
+```
+ai-code-reviewer/
+├── backend/                        # Node.js + Express + TypeScript
+│   ├── src/
+│   │   ├── app.ts                  # Server entry — Express setup, routes, bootstrap
+│   │   ├── types/
+│   │   │   └── index.ts            # All TypeScript interfaces (shared source of truth)
+│   │   ├── middleware/
+│   │   │   └── verifyWebhook.ts    # HMAC-SHA256 signature verification
+│   │   ├── models/
+│   │   │   └── review.ts           # Mongoose schema + IReview interface
+│   │   ├── routes/
+│   │   │   ├── webhook.ts          # POST /webhook — GitHub event handler
+│   │   │   ├── reviews.ts          # GET /api/reviews, /stats, /:id
+│   │   │   └── repos.ts            # GET /api/repos — aggregated repo list
+│   │   └── services/
+│   │       ├── queue.ts            # Bull queue + Redis idempotency helpers
+│   │       ├── github.ts           # Octokit: auth, fetch diff, post comments
+│   │       ├── openai.ts           # GPT-4o review prompt + response parsing
+│   │       └── worker.ts           # Queue processor (runs in-process in dev)
+│   ├── .env                        # Secrets — never commit this
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── frontend/                       # React 18 + TypeScript + Vite
+│   ├── src/
+│   │   ├── App.tsx                 # Route definitions
+│   │   ├── main.tsx                # React entry point
+│   │   ├── types/
+│   │   │   └── index.ts            # Frontend TypeScript interfaces
+│   │   ├── services/
+│   │   │   └── api.ts              # Typed fetch wrapper with generics
+│   │   ├── components/
+│   │   │   └── layout.tsx          # Sidebar + navigation shell
+│   │   └── pages/
+│   │       ├── dashboard.tsx       # Stats cards + activity chart + recent reviews
+│   │       ├── reviews.tsx         # Paginated review list with filters
+│   │       └── reviewDetail.tsx    # Full review with inline comments per file
+│   ├── .env                        # VITE_API_URL=http://localhost:3001
+│   ├── index.html                  # CSS variables for dark GitHub theme
+│   ├── vite.config.ts              # Dev proxy → backend
+│   └── tsconfig.json
+│
+├── worker/
+│   └── src/
+│       └── handler.ts              # AWS Lambda version of the worker (for production)
+│
+├── docker-compose.yml              # Optional: run MongoDB + Redis locally
+└── README.md
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Why |
+|---|---|---|
+| Backend API | Node.js + Express 4 + TypeScript | Familiar, fast, excellent ecosystem |
+| Database | MongoDB Atlas + Mongoose | Flexible schema for variable-length review comments |
+| Queue | Redis (Upstash) + Bull | Async job processing, retries, idempotency |
+| AI Engine | OpenAI GPT-4o | Best code understanding, structured JSON output |
+| GitHub Integration | `@octokit/app` | Official SDK — handles JWT auth, installation tokens |
+| Frontend | React 18 + TypeScript + Vite | Fast dev server, type-safe, modern |
+| Charts | Recharts | Simple, React-native chart library |
+
+---
+
+## Setup Guide
+
+### Prerequisites
+
+- Node.js 18+
+- OpenAI API key — [platform.openai.com](https://platform.openai.com)
+- GitHub account
+- MongoDB Atlas account (free tier) — [cloud.mongodb.com](https://cloud.mongodb.com)
+- Upstash Redis account (free tier) — [console.upstash.com](https://console.upstash.com)
+- ngrok — [ngrok.com/download](https://ngrok.com/download)
+
+---
+
+### Step 1 — Clone and install
+
+```bash
+# Install backend dependencies
+cd backend
+npm install
+
+# Install frontend dependencies
+cd ../frontend
+npm install
+```
+
+---
+
+### Step 2 — Set up MongoDB Atlas
+
+1. Go to [cloud.mongodb.com](https://cloud.mongodb.com) → Create free cluster
+2. **Database Access** → Add user → set username + password (letters/numbers only, no special chars)
+3. **Network Access** → Add IP → Allow access from anywhere (`0.0.0.0/0`)
+4. **Connect** → Drivers → Copy connection string
+5. Replace `<password>` with your actual password, add `/ai-code-reviewer` before `?`
+
+```
+mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/ai-code-reviewer?appName=Cluster0
+```
+
+---
+
+### Step 3 — Set up Upstash Redis
+
+1. Go to [console.upstash.com](https://console.upstash.com) → Create database
+2. Choose region closest to you
+3. Click **TCP** tab → copy the full `REDIS_URL` connection string
+
+---
+
+### Step 4 — Create a GitHub App
+
+1. GitHub → **Settings** → **Developer Settings** → **GitHub Apps** → **New GitHub App**
+2. Fill in:
+   - **Name**: `AI Code Reviewer`
+   - **Homepage URL**: `http://localhost:5173`
+   - **Webhook URL**: `https://YOUR-NGROK-URL/webhook` (from Step 5)
+   - **Webhook secret**: generate a random string (min 32 chars)
+3. **Permissions** → Repository permissions:
+   - Pull requests: `Read & Write`
+   - Contents: `Read only`
+   - Metadata: `Read only`
+4. **Subscribe to events**: check `Pull request` and `Installation`
+5. Click **Create GitHub App**
+6. Note your **App ID** on the settings page
+7. Scroll down → **Generate a private key** → downloads a `.pem` file
+8. **Install App** → select the repository you want to test with
+
+---
+
+### Step 5 — Expose local server with ngrok
+
+```bash
+ngrok http 3001
+# Copy the https URL e.g. https://abc123.ngrok-free.app
+# Go back to your GitHub App settings → update Webhook URL to:
+# https://abc123.ngrok-free.app/webhook
+```
+
+---
+
+### Step 6 — Configure environment
+
+Create `backend/.env`:
+
+```env
+# MongoDB Atlas
+MONGODB_URI=mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/ai-code-reviewer?appName=Cluster0
+
+# Upstash Redis (TCP connection string, no quotes)
+REDIS_URL=rediss://default:yourpassword@your-redis-host.upstash.io:6379
+
+# GitHub App
+GITHUB_APP_ID=123456
+GITHUB_WEBHOOK_SECRET=your_random_secret_min_32_chars
+GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+paste your entire .pem file contents here
+-----END RSA PRIVATE KEY-----"
+
+# OpenAI
+OPENAI_API_KEY=sk-your-key-here
+
+# Server
+PORT=3001
+NODE_ENV=development
+FRONTEND_URL=http://localhost:5173
+```
+
+Create `frontend/.env`:
+
+```env
+VITE_API_URL=http://localhost:3001
+```
+
+**Important `.env` rules:**
+- No spaces around `=`
+- No quotes around Redis URL
+- MongoDB password must have no special characters (`@`, `#`, `$` break the URL)
+- If your password has `@`, URL-encode it as `%40`
+
+---
+
+### Step 7 — Run
+
+```bash
+# Terminal 1 — Backend
+cd backend
+npm run dev
+
+# Expected output:
+# [MongoDB] Connected
+# [Worker] Starting queue processor...
+# [Worker] Ready — listening for jobs
+# [Server] http://localhost:3001 (development)
+
+# Terminal 2 — Frontend
+cd frontend
+npm run dev
+# Open http://localhost:5173
+```
+
+---
+
+### Step 8 — Test end-to-end
+
+1. Make sure ngrok is running and webhook URL is updated in GitHub App settings
+2. Open a pull request on the connected repository
+3. Watch backend terminal — you'll see the webhook arrive, job queue, and review processing
+4. Within 30-60 seconds, AI review comments appear inline on the PR
+5. Refresh `http://localhost:5173` — review appears in dashboard with score and comments
+
+---
+
+## About the Worker folder
+
+`worker/src/handler.ts` is the **AWS Lambda production version** of the queue processor.
+
+In development, the worker runs inside the Express process (simpler, no extra setup).  
+In production, deploy it as a separate Lambda function that polls the Redis queue every minute. Benefits: independent scaling, near-zero cost when idle, crashes don't affect the API server.
+
+## About docker-compose.yml
+
+`docker-compose.yml` is for running MongoDB and Redis **locally** instead of using cloud services.
+
+Since this project is configured to use MongoDB Atlas and Upstash Redis (both free tiers), you don't need Docker. The file is kept for developers who prefer local infrastructure.
+
+---
+
+## Deployment
+
+### Backend → Railway
+
+```bash
+npm install -g @railway/cli
+railway login
+cd backend
+railway init
+railway up
+# Add all .env variables in Railway dashboard
+```
+
+### Frontend → Vercel
+
+```bash
+npm install -g vercel
+cd frontend
+vercel --prod
+# Set VITE_API_URL=https://your-backend.railway.app
+```
+
+### Worker → AWS Lambda (optional, for production scale)
+
+```bash
+cd worker
+npm install -g serverless
+serverless deploy
+```
+
+---
+
+## API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/webhook` | Receives GitHub webhook events |
+| `GET` | `/api/reviews` | Paginated list of reviews |
+| `GET` | `/api/reviews/stats` | Dashboard statistics + queue status |
+| `GET` | `/api/reviews/:id` | Single review with full inline comments |
+| `GET` | `/api/reviews/pr/:owner/:repo/:prNumber` | Lookup review by repo + PR number |
+| `GET` | `/api/repos` | All repos with aggregated stats |
+| `GET` | `/health` | Server health check |
+
+---
+
+## Interview Talking Points
+
+**"How do you prevent duplicate reviews when GitHub retries webhooks?"**
+> GitHub includes an `X-GitHub-Delivery` header — a unique UUID per event. Before queuing a job, I check Redis for that key. If it exists, I skip processing. After a successful review, I set the key with a 24-hour TTL. This makes the entire pipeline idempotent.
+
+**"Why return 200 before processing?"**
+> GitHub marks a delivery failed if it doesn't receive a 2xx response within 10 seconds. GPT-4o reviews take 15-30 seconds. Without async decoupling via Redis queue, every review would time out, trigger retries, and create duplicates.
+
+**"How do you verify webhooks are really from GitHub?"**
+> GitHub signs every payload with HMAC-SHA256 using a shared secret. I recompute the hash and compare with `crypto.timingSafeEqual` — not regular string comparison, which would leak timing information an attacker could use to brute-force the secret.
+
+**"How would you scale this to 10,000 repos?"**
+> The webhook server is stateless — put it behind a load balancer and scale horizontally. Redis queue distributes work naturally across multiple workers. Lambda auto-scales to 1000 concurrent executions. The real bottleneck is OpenAI rate limits — I'd add a token-bucket rate limiter and potentially switch to a fine-tuned open-source model for cost efficiency at scale.
+
+**"What happens if OpenAI is down?"**
+> Bull queue has exponential backoff configured — it retries 3 times with 3s, 6s, 12s delays. If all retries fail, the job is moved to a failed queue and the review is saved to MongoDB with `status: 'failed'`. The dashboard shows failed reviews and they can be manually retried.
